@@ -254,7 +254,7 @@ def index_decisions(
                 continue
 
             cursor = conn.execute(
-                """INSERT INTO design_decisions
+                """INSERT OR IGNORE INTO design_decisions
                    (dd_id, ticket, title, rationale, alternatives, trade_offs,
                     status, extraction_method, source_file, source_line)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
