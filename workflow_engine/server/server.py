@@ -65,6 +65,7 @@ except ImportError:
 
 from workflow_engine.engine import audit as audit_mod
 from workflow_engine.engine import claim as claim_mod
+from workflow_engine.engine import github as github_mod
 from workflow_engine.engine import scheduler as sched_mod
 from workflow_engine.engine.config import load_workflow_config
 from workflow_engine.engine.schema import create_db
@@ -591,6 +592,43 @@ class WorkflowServer:
             "phases": released,
         }
 
+    # -----------------------------------------------------------------------
+    # Git/GitHub operations
+    # -----------------------------------------------------------------------
+
+    def setup_branch(self, ticket_id: str) -> dict[str, Any]:
+        """Create or check out a git branch for the given ticket."""
+        return github_mod.setup_branch(self.project_root, ticket_id, self.conn)
+
+    def commit_and_push(
+        self,
+        agent_id: str,
+        phase_id: int,
+        file_paths: list[str],
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        """Stage files, commit, and push to remote."""
+        return github_mod.commit_and_push(
+            self.project_root, self.conn, agent_id, phase_id, file_paths, message
+        )
+
+    def create_or_update_pr(
+        self,
+        agent_id: str,
+        phase_id: int,
+        title: str | None = None,
+        body: str | None = None,
+        draft: bool = True,
+    ) -> dict[str, Any]:
+        """Create a new PR or update an existing one."""
+        return github_mod.create_or_update_pr(
+            self.project_root, self.conn, agent_id, phase_id, title, body, draft
+        )
+
+    def post_pr_comment(self, body: str) -> dict[str, Any]:
+        """Post a comment on the PR for the current branch."""
+        return github_mod.post_pr_comment(self.project_root, body)
+
     def get_dashboard(self) -> dict[str, Any]:
         """Summary dashboard: agents, gates, phase counts by status."""
         phase_counts = dict(
@@ -959,6 +997,87 @@ def create_mcp_server(db_path: str, project_root: str) -> "FastMCP":
         (default: 30 minutes) and releases their claimed phases back to available.
         """
         return json.dumps(ws.cleanup_stale(), indent=2)
+
+    # -----------------------------------------------------------------------
+    # Git/GitHub tools
+    # -----------------------------------------------------------------------
+
+    @mcp.tool()
+    def setup_branch(ticket_id: str) -> str:
+        """
+        Create or check out a git branch for a ticket.
+
+        Derives the branch name from the ticket's full_name (underscores become
+        hyphens). If the branch already exists, checks it out. Otherwise creates
+        it from main.
+
+        Args:
+            ticket_id: Ticket ID (e.g. '0041')
+        """
+        return json.dumps(ws.setup_branch(ticket_id), indent=2)
+
+    @mcp.tool()
+    def commit_and_push(
+        agent_id: str,
+        phase_id: int,
+        file_paths: str,
+        message: str | None = None,
+    ) -> str:
+        """
+        Stage files, commit, and push to remote.
+
+        If no message is provided, auto-generates one from the phase and ticket
+        info (e.g. 'impl: feature name').
+
+        Args:
+            agent_id: Your agent ID
+            phase_id: Your claimed phase ID
+            file_paths: JSON array of file paths to stage (e.g. '["src/foo.cpp"]')
+            message: Optional commit message (auto-generated if omitted)
+        """
+        paths = json.loads(file_paths)
+        return json.dumps(
+            ws.commit_and_push(agent_id, phase_id, paths, message), indent=2
+        )
+
+    @mcp.tool()
+    def create_or_update_pr(
+        agent_id: str,
+        phase_id: int,
+        title: str | None = None,
+        body: str | None = None,
+        draft: bool = True,
+    ) -> str:
+        """
+        Create a new PR or update an existing one for the current branch.
+
+        If a PR already exists, returns its info. If draft=False and a draft PR
+        exists, marks it as ready for review. Auto-generates title and body from
+        ticket/phase info if not provided.
+
+        Args:
+            agent_id: Your agent ID
+            phase_id: Your claimed phase ID
+            title: Optional PR title (auto-generated if omitted)
+            body: Optional PR body (auto-generated if omitted)
+            draft: Whether to create as draft PR (default: True)
+        """
+        return json.dumps(
+            ws.create_or_update_pr(agent_id, phase_id, title, body, draft),
+            indent=2,
+        )
+
+    @mcp.tool()
+    def post_pr_comment(body: str) -> str:
+        """
+        Post a comment on the PR associated with the current branch.
+
+        Finds the PR for the current branch and posts the given comment body.
+
+        Args:
+            body: The comment text to post
+        """
+        return json.dumps(ws.post_pr_comment(body), indent=2)
 
     # MCP Resources
     @mcp.resource("workflow://dashboard")
