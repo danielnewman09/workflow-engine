@@ -1019,7 +1019,7 @@ Examples:
             sys.exit(1)
         mcp_server = create_mcp_server(str(db_path), str(project_root))
         if args.transport == "sse":
-            mcp_server.run(transport="sse", port=args.port)
+            mcp_server.run(transport="sse", host="0.0.0.0", port=args.port)
         else:
             mcp_server.run(transport="stdio")
         return
