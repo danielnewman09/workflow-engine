@@ -544,6 +544,34 @@ def cmd_cleanup_stale(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def cmd_supervisor(args: argparse.Namespace) -> int:
+    """Run the agent supervisor daemon."""
+    import asyncio
+    import logging
+
+    from workflow_engine.supervisor.supervisor import Supervisor
+
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    _, config, _ = _open_db(args)
+    db_path = args.db if args.db else config.db_path
+
+    supervisor = Supervisor(
+        db_path=db_path,
+        config=config,
+        poll_interval=args.poll_interval,
+        dry_run=args.dry_run,
+    )
+
+    asyncio.run(supervisor.run())
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Main CLI
 # ---------------------------------------------------------------------------
@@ -643,6 +671,28 @@ def main() -> None:
     # cleanup-stale
     p_cleanup = subparsers.add_parser("cleanup-stale", help="Release stale agent claims")
     p_cleanup.set_defaults(func=cmd_cleanup_stale)
+
+    # supervisor
+    p_supervisor = subparsers.add_parser(
+        "supervisor", help="Run the agent supervisor daemon"
+    )
+    p_supervisor.add_argument(
+        "--poll-interval",
+        type=float,
+        default=30,
+        help="Seconds between poll cycles (default: 30)",
+    )
+    p_supervisor.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would spawn without actually spawning agents",
+    )
+    p_supervisor.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (default: INFO)",
+    )
+    p_supervisor.set_defaults(func=cmd_supervisor)
 
     args = parser.parse_args()
     sys.exit(args.func(args))
