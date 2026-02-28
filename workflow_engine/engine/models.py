@@ -414,5 +414,11 @@ class WorkflowConfig:
     priority_order: list[str] = field(
         default_factory=lambda: ["Critical", "High", "Medium", "Low"]
     )
+    github_repository: str | None = None  # e.g. "owner/repo" for gh CLI
+    traceability_db_path: str | None = None  # path to traceability.db
+    traceability_source_dir: str = "msd"  # C++ source dir for symbol indexing
+    traceability_designs_dir: str = "docs/designs"  # design documents directory
+    traceability_models_path: str = "replay/replay/models.py"  # Pydantic models
+    traceability_generated_models_path: str = "replay/replay/generated_models.py"
     agent_registry: dict[str, dict] = field(default_factory=dict)
     phase_definitions: list[PhaseDefinition] = field(default_factory=list)

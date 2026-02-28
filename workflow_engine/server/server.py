@@ -26,6 +26,11 @@ MCP Tools exposed:
     fail_phase           — report phase failure
     release_phase        — release a claimed phase back to available
     request_human_review — create a human gate blocking the next phase
+    approve_gate         — human approves a pending gate, unblocking the next phase
+    reject_gate          — human rejects a pending gate with feedback
+    get_pr_reviews       — fetch reviews and comments from the current branch's PR
+    reply_to_review_comment — reply to an inline review comment (attributed to Claude)
+    request_gate_revisions — request revisions on a gate, pulling PR comments as context
     get_ticket_status    — full ticket status with all phases
     list_tickets         — query tickets by criteria
     list_blocked         — list all phases blocked on gates or dependencies
@@ -38,6 +43,17 @@ MCP Tools exposed:
     import_tickets       — import/refresh tickets from markdown
     run_scheduler        — seed phases and resolve availability
     cleanup_stale        — release stale agent claims
+
+Traceability tools (registered when traceability.db_path is configured):
+    search_decisions     — FTS search across design decision rationale
+    get_decision         — full details of a design decision
+    get_symbol_history   — timeline of changes to a symbol
+    get_ticket_impact    — all impact data for a ticket
+    get_commit_context   — context for a commit
+    why_symbol           — design decision(s) behind a symbol
+    get_snapshot_symbols — symbols at a point in time
+    get_record_mappings  — four-layer field lists with drift analysis
+    check_record_drift   — records with missing downstream fields
 
 MCP Resources:
     workflow://dashboard           — summary dashboard
@@ -69,6 +85,9 @@ from workflow_engine.engine import github as github_mod
 from workflow_engine.engine import scheduler as sched_mod
 from workflow_engine.engine.config import load_workflow_config
 from workflow_engine.engine.schema import create_db
+from workflow_engine.traceability.schema import ensure_schema as ensure_trace_schema
+from workflow_engine.traceability.server import TraceabilityServer
+from workflow_engine.traceability.reindex import reindex_all as trace_reindex_all
 
 
 class WorkflowServer:
@@ -85,8 +104,24 @@ class WorkflowServer:
         self.conn = create_db(db_path)
         self.config = load_workflow_config(project_root)
 
+        # ATTACH traceability DB if configured
+        self.trace_server: TraceabilityServer | None = None
+        self.trace_db_path: str | None = self.config.traceability_db_path
+        if self.trace_db_path:
+            trace_path = Path(self.trace_db_path)
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            # Create a dedicated connection for traceability queries
+            self.trace_conn = sqlite3.connect(str(trace_path))
+            self.trace_conn.row_factory = sqlite3.Row
+            self.trace_conn.execute("PRAGMA journal_mode=WAL")
+            self.trace_conn.execute("PRAGMA foreign_keys=ON")
+            ensure_trace_schema(self.trace_conn)
+            self.trace_server = TraceabilityServer(self.trace_conn)
+
     def close(self) -> None:
-        """Close the database connection."""
+        """Close all database connections."""
+        if hasattr(self, 'trace_conn') and self.trace_conn:
+            self.trace_conn.close()
         self.conn.close()
 
     # -----------------------------------------------------------------------
@@ -303,6 +338,98 @@ class WorkflowServer:
                 "Run: workflow-engine gates  to see pending reviews."
             ),
         }
+
+    def approve_gate(
+        self,
+        gate_id: int,
+        decided_by: str,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Approve a pending human review gate, unblocking the next phase.
+
+        This must be called by a human reviewer — agents should not call
+        this tool directly.
+        """
+        return sched_mod.resolve_gate(
+            self.conn, gate_id, "approved", decided_by, notes
+        )
+
+    def reject_gate(
+        self,
+        gate_id: int,
+        decided_by: str,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Reject a pending human review gate with feedback.
+
+        The associated phase remains blocked. The upstream phase may need
+        to be re-run to address the feedback.
+        """
+        return sched_mod.resolve_gate(
+            self.conn, gate_id, "rejected", decided_by, notes
+        )
+
+    def request_gate_revisions(
+        self,
+        gate_id: int,
+        decided_by: str,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Request revisions on a human gate, pulling PR review comments as context.
+
+        Fetches all reviews and comments from the current branch's PR,
+        formats them as the gate's decision notes, and marks the gate as
+        changes_requested.
+        """
+        # Fetch PR reviews
+        pr_data = github_mod.get_pr_reviews(self.project_root)
+
+        # Build revision notes from PR feedback
+        feedback_parts = []
+        if notes:
+            feedback_parts.append(notes)
+
+        if "error" not in pr_data:
+            for review in pr_data.get("reviews", []):
+                if review.get("body"):
+                    feedback_parts.append(
+                        f"[Review by {review['author']} ({review['state']})]: {review['body']}"
+                    )
+            for comment in pr_data.get("comments", []):
+                if comment.get("body"):
+                    feedback_parts.append(
+                        f"[Comment by {comment['author']}]: {comment['body']}"
+                    )
+            for rc in pr_data.get("review_comments", []):
+                if rc.get("body"):
+                    location = f"{rc.get('path', '?')}:{rc.get('line', '?')}"
+                    feedback_parts.append(
+                        f"[Inline at {location} by {rc['author']}]: {rc['body']}"
+                    )
+
+        combined_notes = "\n\n".join(feedback_parts) if feedback_parts else None
+
+        result = sched_mod.resolve_gate(
+            self.conn, gate_id, "changes_requested", decided_by, combined_notes
+        )
+        result["pr_number"] = pr_data.get("pr_number")
+        result["feedback_items"] = len(feedback_parts)
+        return result
+
+    def get_pr_reviews(self) -> dict[str, Any]:
+        """Fetch reviews and comments from the current branch's PR."""
+        return github_mod.get_pr_reviews(self.project_root)
+
+    def reply_to_review_comment(
+        self,
+        comment_id: int,
+        body: str,
+    ) -> dict[str, Any]:
+        """Reply to an inline review comment on the current branch's PR."""
+        return github_mod.reply_to_review_comment(self.project_root, comment_id, body)
 
     # -----------------------------------------------------------------------
     # Query tools
@@ -607,10 +734,20 @@ class WorkflowServer:
         file_paths: list[str],
         message: str | None = None,
     ) -> dict[str, Any]:
-        """Stage files, commit, and push to remote."""
-        return github_mod.commit_and_push(
+        """Stage files, commit, and push to remote. Triggers traceability reindex."""
+        result = github_mod.commit_and_push(
             self.project_root, self.conn, agent_id, phase_id, file_paths, message
         )
+
+        # Trigger incremental traceability reindex after successful commit
+        if self.trace_server is not None and result.get("status") != "error":
+            try:
+                trace_result = self.trace_reindex(skip_symbols=True)
+                result["traceability_reindex"] = trace_result
+            except Exception as e:
+                result["traceability_reindex_error"] = str(e)
+
+        return result
 
     def create_or_update_pr(
         self,
@@ -655,6 +792,66 @@ class WorkflowServer:
             "pending_human_gates": pending_gates,
             "phase_counts": phase_counts,
         }
+
+    # -------------------------------------------------------------------
+    # Traceability tools (delegated to TraceabilityServer)
+    # -------------------------------------------------------------------
+
+    def _require_trace(self) -> TraceabilityServer:
+        """Return the traceability server or raise an error."""
+        if self.trace_server is None:
+            raise RuntimeError(
+                "Traceability not configured. Add a 'traceability' section "
+                "to .workflow/config.yaml with db_path."
+            )
+        return self.trace_server
+
+    def trace_search_decisions(
+        self, query: str, ticket: str | None = None, status: str | None = None
+    ) -> list[dict]:
+        return self._require_trace().search_decisions(query, ticket, status)
+
+    def trace_get_decision(self, dd_id: str) -> dict:
+        return self._require_trace().get_decision(dd_id)
+
+    def trace_get_symbol_history(self, qualified_name: str) -> list[dict]:
+        return self._require_trace().get_symbol_history(qualified_name)
+
+    def trace_get_ticket_impact(self, ticket_number: str) -> dict:
+        return self._require_trace().get_ticket_impact(ticket_number)
+
+    def trace_get_commit_context(self, commit_sha: str) -> dict:
+        return self._require_trace().get_commit_context(commit_sha)
+
+    def trace_why_symbol(self, qualified_name: str) -> dict:
+        return self._require_trace().why_symbol(qualified_name)
+
+    def trace_get_snapshot_symbols(
+        self, commit_sha: str, file_path: str | None = None
+    ) -> list[dict]:
+        return self._require_trace().get_snapshot_symbols(commit_sha, file_path)
+
+    def trace_get_record_mappings(self, record_name: str) -> dict:
+        return self._require_trace().get_record_mappings(record_name)
+
+    def trace_check_record_drift(self) -> list[dict]:
+        return self._require_trace().check_record_drift()
+
+    def trace_reindex(self, skip_symbols: bool = False) -> dict:
+        """Run incremental traceability reindexing."""
+        self._require_trace()
+        return trace_reindex_all(
+            self.trace_conn,
+            str(self.project_root),
+            source_dir=self.config.traceability_source_dir,
+            designs_dir=self.config.traceability_designs_dir,
+            tickets_dir=str(Path(self.config.tickets_directory).relative_to(self.project_root))
+            if Path(self.config.tickets_directory).is_absolute()
+            else self.config.tickets_directory,
+            models_path=self.config.traceability_models_path,
+            generated_models_path=self.config.traceability_generated_models_path,
+            skip_symbols=skip_symbols,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +1029,102 @@ def create_mcp_server(db_path: str, project_root: str) -> "FastMCP":
         context_dict = json.loads(context) if context else None
         return json.dumps(
             ws.request_human_review(phase_id, gate_type, context_dict), indent=2
+        )
+
+    @mcp.tool()
+    def approve_gate(
+        gate_id: int,
+        decided_by: str,
+        notes: str | None = None,
+    ) -> str:
+        """
+        Approve a pending human review gate, unblocking the next phase.
+
+        Only a human reviewer should trigger this tool. Use list_blocked to
+        find pending gates and their IDs.
+
+        Args:
+            gate_id: The gate ID to approve (from list_blocked or get_ticket_status)
+            decided_by: Name of the human reviewer approving the gate
+            notes: Optional approval notes or comments
+        """
+        return json.dumps(
+            ws.approve_gate(gate_id, decided_by, notes), indent=2
+        )
+
+    @mcp.tool()
+    def reject_gate(
+        gate_id: int,
+        decided_by: str,
+        notes: str | None = None,
+    ) -> str:
+        """
+        Reject a pending human review gate with feedback.
+
+        The associated phase remains blocked. The upstream work may need to
+        be revised to address the feedback.
+
+        Args:
+            gate_id: The gate ID to reject (from list_blocked or get_ticket_status)
+            decided_by: Name of the human reviewer rejecting the gate
+            notes: Feedback explaining why the gate was rejected
+        """
+        return json.dumps(
+            ws.reject_gate(gate_id, decided_by, notes), indent=2
+        )
+
+    @mcp.tool()
+    def get_pr_reviews() -> str:
+        """
+        Fetch all reviews and comments from the current branch's PR.
+
+        Returns PR reviews (approve/request changes), conversation comments,
+        and inline code review comments. Use this to check feedback before
+        approving or requesting revisions on a gate.
+        """
+        return json.dumps(
+            ws.get_pr_reviews(), indent=2, default=str
+        )
+
+    @mcp.tool()
+    def reply_to_review_comment(
+        comment_id: int,
+        body: str,
+    ) -> str:
+        """
+        Reply to an inline review comment on the current branch's PR.
+
+        The reply is posted as a threaded response to the specific review
+        comment, attributed to Claude. Use get_pr_reviews to find comment IDs.
+
+        Args:
+            comment_id: The review comment ID to reply to (from get_pr_reviews review_comments[].id)
+            body: The reply text (Claude signature is appended automatically)
+        """
+        return json.dumps(
+            ws.reply_to_review_comment(comment_id, body), indent=2
+        )
+
+    @mcp.tool()
+    def request_gate_revisions(
+        gate_id: int,
+        decided_by: str,
+        notes: str | None = None,
+    ) -> str:
+        """
+        Request revisions on a human review gate, pulling PR comments as context.
+
+        Fetches all reviews and comments from the current branch's PR,
+        combines them with any additional notes, and marks the gate as
+        changes_requested. The associated phase remains blocked.
+
+        Args:
+            gate_id: The gate ID (from list_blocked or get_ticket_status)
+            decided_by: Name of the human reviewer requesting revisions
+            notes: Optional additional notes beyond the PR comments
+        """
+        return json.dumps(
+            ws.request_gate_revisions(gate_id, decided_by, notes), indent=2
         )
 
     @mcp.tool()
@@ -1079,6 +1372,71 @@ def create_mcp_server(db_path: str, project_root: str) -> "FastMCP":
         """
         return json.dumps(ws.post_pr_comment(body), indent=2)
 
+    # ----- Traceability tools -----
+    # Only registered if traceability is configured
+
+    if ws.trace_server is not None:
+        @mcp.tool()
+        def search_decisions(
+            query: str, ticket: str | None = None, status: str | None = None
+        ) -> str:
+            """FTS search across design decision rationale, alternatives, and trade-offs."""
+            return json.dumps(
+                ws.trace_search_decisions(query, ticket, status), indent=2, default=str
+            )
+
+        @mcp.tool()
+        def get_decision(dd_id: str) -> str:
+            """Get full details of a design decision with linked symbols and commits."""
+            return json.dumps(ws.trace_get_decision(dd_id), indent=2, default=str)
+
+        @mcp.tool()
+        def get_symbol_history(qualified_name: str) -> str:
+            """Timeline of changes to a symbol across commits (supports % wildcards)."""
+            return json.dumps(
+                ws.trace_get_symbol_history(qualified_name), indent=2, default=str
+            )
+
+        @mcp.tool()
+        def get_ticket_impact(ticket_number: str) -> str:
+            """All commits, file changes, symbol changes, and decisions for a ticket."""
+            return json.dumps(
+                ws.trace_get_ticket_impact(ticket_number), indent=2, default=str
+            )
+
+        @mcp.tool()
+        def get_commit_context(commit_sha: str) -> str:
+            """Context for a commit: ticket, phase, file changes, symbol changes, decisions."""
+            return json.dumps(
+                ws.trace_get_commit_context(commit_sha), indent=2, default=str
+            )
+
+        @mcp.tool()
+        def why_symbol(qualified_name: str) -> str:
+            """Design decision(s) that created or modified a symbol, with rationale."""
+            return json.dumps(ws.trace_why_symbol(qualified_name), indent=2, default=str)
+
+        @mcp.tool()
+        def get_snapshot_symbols(
+            commit_sha: str, file_path: str | None = None
+        ) -> str:
+            """All symbols at a specific point in time, optionally filtered by file."""
+            return json.dumps(
+                ws.trace_get_snapshot_symbols(commit_sha, file_path), indent=2, default=str
+            )
+
+        @mcp.tool()
+        def get_record_mappings(record_name: str) -> str:
+            """Return all four layers' field lists for a record with drift analysis."""
+            return json.dumps(
+                ws.trace_get_record_mappings(record_name), indent=2, default=str
+            )
+
+        @mcp.tool()
+        def check_record_drift() -> str:
+            """Return all records with fields missing from downstream layers."""
+            return json.dumps(ws.trace_check_record_drift(), indent=2, default=str)
+
     # MCP Resources
     @mcp.resource("workflow://dashboard")
     def dashboard() -> str:
@@ -1112,7 +1470,10 @@ Examples:
     # MCP server mode (used by Claude Code)
     python server.py build/Debug/docs/workflow.db --project-root .
 
-    # SSE mode (Docker)
+    # Streamable HTTP mode (Docker, recommended)
+    python server.py workflow.db --project-root /app/project --transport streamable-http --port 8080
+
+    # SSE mode (legacy)
     python server.py workflow.db --project-root /app/project --transport sse --port 8080
 
     # CLI smoke tests
@@ -1122,8 +1483,12 @@ Examples:
     )
     parser.add_argument("database", help="Path to the workflow SQLite database")
     parser.add_argument("--project-root", default=".", help="Path to consuming repo root")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
-    parser.add_argument("--port", type=int, default=8080, help="Port for SSE mode")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default="stdio",
+    )
+    parser.add_argument("--port", type=int, default=8080, help="Port for HTTP/SSE mode")
     parser.add_argument(
         "command",
         nargs="?",
@@ -1141,8 +1506,10 @@ Examples:
             print("Error: mcp package not installed. Run: pip install mcp", file=sys.stderr)
             sys.exit(1)
         mcp_server = create_mcp_server(str(db_path), str(project_root))
-        if args.transport == "sse":
-            mcp_server.run(transport="sse", host="0.0.0.0", port=args.port)
+        if args.transport in ("sse", "streamable-http"):
+            mcp_server.run(
+                transport=args.transport, host="0.0.0.0", port=args.port
+            )
         else:
             mcp_server.run(transport="stdio")
         return

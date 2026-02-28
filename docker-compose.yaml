@@ -4,16 +4,23 @@ services:
   workflow:
     build: .
     ports:
-      - "8080:8080"
+      - "${WORKFLOW_PORT:-8080}:8080"
     volumes:
-      # Mount the consuming repo root (provides .workflow/ config directory)
-      - .:/project:ro
+      # Mount the consuming repo root (provides .workflow/ config and .git for branch/PR ops)
+      - ${PROJECT_ROOT:-.}:/project
       # Persist the database
       - workflow-data:/data
     environment:
       PROJECT_ROOT: /project
       DB_PATH: /data/workflow.db
       PORT: 8080
+      # Git identity (derived from host git config)
+      GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME}
+      GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL}
+      GIT_COMMITTER_NAME: ${GIT_COMMITTER_NAME}
+      GIT_COMMITTER_EMAIL: ${GIT_COMMITTER_EMAIL}
+      # GitHub auth (derived from host gh auth token)
+      GH_TOKEN: ${GH_TOKEN}
     restart: unless-stopped
 
 volumes:

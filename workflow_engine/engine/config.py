@@ -219,6 +219,22 @@ def load_workflow_config(
     # Priority order
     priority_order = config_doc.get("priority_order", ["Critical", "High", "Medium", "Low"])
 
+    # GitHub settings
+    github_section = config_doc.get("github", {})
+    github_repository = github_section.get("repository")
+
+    # Traceability settings
+    trace_section = config_doc.get("traceability", {})
+    traceability_db_path = trace_section.get("db_path")
+    if traceability_db_path and not Path(traceability_db_path).is_absolute():
+        traceability_db_path = str(project_root / traceability_db_path)
+    traceability_source_dir = trace_section.get("source_dir", "msd")
+    traceability_designs_dir = trace_section.get("designs_dir", "docs/designs")
+    traceability_models_path = trace_section.get("models_path", "replay/replay/models.py")
+    traceability_generated_models_path = trace_section.get(
+        "generated_models_path", "replay/replay/generated_models.py"
+    )
+
     return WorkflowConfig(
         db_path=db_path,
         tickets_directory=tickets_directory,
@@ -230,6 +246,12 @@ def load_workflow_config(
         markdown_status_update=markdown_status_update,
         markdown_log_update=markdown_log_update,
         priority_order=priority_order,
+        github_repository=github_repository,
+        traceability_db_path=traceability_db_path,
+        traceability_source_dir=traceability_source_dir,
+        traceability_designs_dir=traceability_designs_dir,
+        traceability_models_path=traceability_models_path,
+        traceability_generated_models_path=traceability_generated_models_path,
         agent_registry=agent_registry,
         phase_definitions=phase_definitions,
     )
