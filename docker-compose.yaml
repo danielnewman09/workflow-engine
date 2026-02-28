@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  workflow:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount the consuming repo root (provides .workflow/ config directory)
+      - .:/project:ro
+      # Persist the database
+      - workflow-data:/data
+    environment:
+      PROJECT_ROOT: /project
+      DB_PATH: /data/workflow.db
+      PORT: 8080
+    restart: unless-stopped
+
+volumes:
+  workflow-data:
