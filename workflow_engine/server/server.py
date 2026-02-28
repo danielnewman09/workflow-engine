@@ -54,10 +54,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
     HAS_MCP = True
 except ImportError:
-    HAS_MCP = False
+    try:
+        from mcp.server.fastmcp import FastMCP
+        HAS_MCP = True
+    except ImportError:
+        HAS_MCP = False
 
 from workflow_engine.engine import audit as audit_mod
 from workflow_engine.engine import claim as claim_mod
