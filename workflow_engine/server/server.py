@@ -111,7 +111,8 @@ class WorkflowServer:
             trace_path = Path(self.trace_db_path)
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             # Create a dedicated connection for traceability queries
-            self.trace_conn = sqlite3.connect(str(trace_path))
+            # check_same_thread=False needed because FastMCP runs tools on worker threads
+            self.trace_conn = sqlite3.connect(str(trace_path), check_same_thread=False)
             self.trace_conn.row_factory = sqlite3.Row
             self.trace_conn.execute("PRAGMA journal_mode=WAL")
             self.trace_conn.execute("PRAGMA foreign_keys=ON")
