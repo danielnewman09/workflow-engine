@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from workflow_engine.engine.github import (
+    CLAUDE_SIGNATURE,
     PHASE_PREFIX_MAP,
     _derive_branch_name,
     _feature_name_from_full_name,
@@ -184,11 +185,13 @@ class TestCommitAndPush:
 
         mock_git.side_effect = [
             _mock_run(),  # git add
+            _mock_run(returncode=1),  # git diff --cached --quiet (1 = has diffs)
             _mock_run(),  # git commit
-            _mock_run(stdout="0041-feature-name\n"),  # git branch --show-current
-            _mock_run(),  # git rev-parse upstream (success = has upstream)
-            _mock_run(),  # git push
             _mock_run(stdout="abc123def\n"),  # git rev-parse HEAD
+            _mock_run(stdout="0041-feature-name\n"),  # git branch --show-current
+            _mock_run(),  # git rev-parse --abbrev-ref upstream (success = has upstream)
+            _mock_run(stdout="oldsha000\n"),  # git rev-parse upstream SHA (different = needs push)
+            _mock_run(),  # git push
         ]
 
         result = commit_and_push(
@@ -212,11 +215,12 @@ class TestCommitAndPush:
 
         mock_git.side_effect = [
             _mock_run(),  # git add
+            _mock_run(returncode=1),  # git diff --cached --quiet (1 = has diffs)
             _mock_run(),  # git commit
-            _mock_run(stdout="0041-feature-name\n"),  # branch
+            _mock_run(stdout="abc123\n"),  # rev-parse HEAD
+            _mock_run(stdout="0041-feature-name\n"),  # branch --show-current
             _mock_run(returncode=1),  # upstream check fails (no upstream)
             _mock_run(),  # git push -u origin
-            _mock_run(stdout="abc123\n"),  # rev-parse HEAD
         ]
 
         result = commit_and_push(
@@ -226,13 +230,13 @@ class TestCommitAndPush:
         assert result["pushed"] is True
 
         # Verify auto-generated commit message was passed
-        commit_call = mock_git.call_args_list[1]
+        commit_call = mock_git.call_args_list[2]
         commit_msg = commit_call[0][1][2]  # args[1] = ["commit", "-m", message]
         assert commit_msg.startswith("impl: feature name")
         assert "Co-Authored-By:" in commit_msg
 
         # Verify push -u was used (no upstream)
-        push_call = mock_git.call_args_list[4]
+        push_call = mock_git.call_args_list[6]
         assert push_call == call(
             project_root, ["push", "-u", "origin", "0041-feature-name"]
         )
@@ -268,6 +272,8 @@ class TestCreateOrUpdatePr:
 
         mock_gh.side_effect = [
             _mock_run(stdout=""),  # no existing PR
+            _mock_run(),  # gh label create ticket:0041
+            _mock_run(),  # gh label create phase:C++ Implementation
             _mock_run(stdout="https://github.com/org/repo/pull/42\n"),  # pr create
         ]
 
@@ -342,10 +348,10 @@ class TestPostPrComment:
         assert result["pr_number"] == 42
         assert result["commented"] is True
 
-        # Verify comment body was passed
+        # Verify comment body was passed with Claude signature
         comment_call = mock_gh.call_args_list[1]
         assert comment_call == call(
-            project_root, ["pr", "comment", "42", "--body", "Phase complete!"]
+            project_root, ["pr", "comment", "42", "--body", "Phase complete!" + CLAUDE_SIGNATURE]
         )
 
     @patch("workflow_engine.engine.github._run_gh")
