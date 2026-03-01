@@ -43,6 +43,7 @@ MCP Tools exposed:
     import_tickets       — import/refresh tickets from markdown
     run_scheduler        — seed phases and resolve availability
     cleanup_stale        — release stale agent claims
+    log_build_attempt    — log implementer build attempt + circle detection
 
 Traceability tools (registered when traceability.db_path is configured):
     search_decisions     — FTS search across design decision rationale
@@ -854,6 +855,45 @@ class WorkflowServer:
             skip_symbols=skip_symbols,
         )
 
+    # -----------------------------------------------------------------------
+    # Implementation build log
+    # -----------------------------------------------------------------------
+
+    def log_build_attempt(
+        self,
+        phase_id: int,
+        agent_id: str,
+        hypothesis: str | None = None,
+        files_changed: list[str] | None = None,
+        build_result: str = "fail",
+        compiler_output: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Log an implementation build attempt and check for circles.
+
+        Returns attempt number and circle detection status.
+        """
+        from workflow_engine.engine.schema import insert_build_attempt
+
+        # Look up ticket_id from the phase
+        phase = self.conn.execute(
+            "SELECT ticket_id FROM phases WHERE id = ?", (phase_id,)
+        ).fetchone()
+        if phase is None:
+            return {"error": f"Phase {phase_id} not found"}
+
+        ticket_id = phase["ticket_id"]
+        return insert_build_attempt(
+            self.conn,
+            phase_id=phase_id,
+            agent_id=agent_id,
+            ticket_id=ticket_id,
+            hypothesis=hypothesis,
+            files_changed=files_changed,
+            build_result=build_result,
+            compiler_output=compiler_output,
+        )
+
 
 # ---------------------------------------------------------------------------
 # FastMCP server factory
@@ -1372,6 +1412,47 @@ def create_mcp_server(db_path: str, project_root: str) -> "FastMCP":
             body: The comment text to post
         """
         return json.dumps(ws.post_pr_comment(body), indent=2)
+
+    # ----- Implementation build log -----
+
+    @mcp.tool()
+    def log_build_attempt(
+        phase_id: int,
+        agent_id: str,
+        hypothesis: str | None = None,
+        files_changed: str | None = None,
+        build_result: str = "fail",
+        compiler_output: str | None = None,
+    ) -> str:
+        """
+        Log an implementation build attempt to the impl_build_log table.
+
+        Call this after each `cmake --build` attempt during implementation.
+        Returns the attempt number and whether circle detection triggered.
+
+        If circle_detected is true, the implementer MUST stop and produce
+        implementation-findings.md for human escalation.
+
+        Args:
+            phase_id: Your claimed phase ID
+            agent_id: Your agent ID
+            hypothesis: What you intended to fix/implement in this attempt
+            files_changed: JSON array of file paths you modified (e.g. '["src/foo.cpp", "src/bar.hpp"]')
+            build_result: 'pass' or 'fail'
+            compiler_output: First ~4000 chars of compiler stdout/stderr
+        """
+        files_list = json.loads(files_changed) if files_changed else None
+        return json.dumps(
+            ws.log_build_attempt(
+                phase_id=phase_id,
+                agent_id=agent_id,
+                hypothesis=hypothesis,
+                files_changed=files_list,
+                build_result=build_result,
+                compiler_output=compiler_output,
+            ),
+            indent=2,
+        )
 
     # ----- Traceability tools -----
     # Only registered if traceability is configured

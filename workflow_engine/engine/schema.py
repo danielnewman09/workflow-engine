@@ -26,7 +26,7 @@ import sqlite3
 from pathlib import Path
 
 # Current schema version — increment when adding tables or columns
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Connection helper
@@ -171,6 +171,22 @@ CREATE TABLE IF NOT EXISTS audit_log (
 )
 """
 
+_CREATE_IMPL_BUILD_LOG = """
+CREATE TABLE IF NOT EXISTS impl_build_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    phase_id        INTEGER NOT NULL REFERENCES phases(id),
+    agent_id        TEXT NOT NULL,
+    ticket_id       TEXT NOT NULL,
+    attempt_number  INTEGER NOT NULL,           -- 1, 2, 3, ...
+    hypothesis      TEXT,                       -- what the agent intended to fix/implement
+    files_changed   TEXT,                       -- JSON array of file paths modified
+    build_result    TEXT NOT NULL               -- 'pass' or 'fail'
+                        CHECK(build_result IN ('pass', 'fail')),
+    compiler_output TEXT,                       -- truncated stdout/stderr
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
 # ---------------------------------------------------------------------------
 # Indexes for common queries
 # ---------------------------------------------------------------------------
@@ -186,6 +202,9 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id)",
     # Partial index: only active (unreleased) file locks
     "CREATE INDEX IF NOT EXISTS idx_file_locks_active ON file_locks(file_path) WHERE released_at IS NULL",
+    # impl_build_log indexes
+    "CREATE INDEX IF NOT EXISTS idx_impl_build_log_phase ON impl_build_log(phase_id)",
+    "CREATE INDEX IF NOT EXISTS idx_impl_build_log_ticket ON impl_build_log(ticket_id)",
 ]
 
 # All DDL in dependency order
@@ -197,6 +216,7 @@ SCHEMA_STATEMENTS: list[str] = [
     _CREATE_AGENTS,
     _CREATE_FILE_LOCKS,
     _CREATE_AUDIT_LOG,
+    _CREATE_IMPL_BUILD_LOG,
     *_INDEXES,
 ]
 
@@ -236,11 +256,19 @@ def migrate(conn: sqlite3.Connection) -> None:
         set_schema_version(conn, 1)
         conn.commit()
 
-    # Future migrations:
-    # if current < 2:
-    #     conn.execute("ALTER TABLE tickets ADD COLUMN ...")
-    #     set_schema_version(conn, 2)
-    #     conn.commit()
+    if current < 2:
+        # Version 1 → 2: Add impl_build_log table for TDD workflow
+        conn.execute(_CREATE_IMPL_BUILD_LOG)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_impl_build_log_phase "
+            "ON impl_build_log(phase_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_impl_build_log_ticket "
+            "ON impl_build_log(ticket_id)"
+        )
+        set_schema_version(conn, 2)
+        conn.commit()
 
 
 def create_db(db_path: str | Path) -> sqlite3.Connection:
@@ -255,3 +283,88 @@ def create_db(db_path: str | Path) -> sqlite3.Connection:
     conn = open_db(path)
     migrate(conn)
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Implementation build log helpers
+# ---------------------------------------------------------------------------
+
+
+def insert_build_attempt(
+    conn: sqlite3.Connection,
+    phase_id: int,
+    agent_id: str,
+    ticket_id: str,
+    hypothesis: str | None = None,
+    files_changed: list[str] | None = None,
+    build_result: str = "fail",
+    compiler_output: str | None = None,
+) -> dict:
+    """
+    Insert a row into impl_build_log and return attempt number + circle status.
+
+    Circle detection: if 3+ attempts modify overlapping files with similar
+    hypotheses, returns circle_detected=True.
+    """
+    import json as _json
+
+    # Determine next attempt number for this phase
+    row = conn.execute(
+        "SELECT COALESCE(MAX(attempt_number), 0) AS max_attempt "
+        "FROM impl_build_log WHERE phase_id = ?",
+        (phase_id,),
+    ).fetchone()
+    attempt_number = row["max_attempt"] + 1
+
+    files_json = _json.dumps(files_changed) if files_changed else None
+    # Truncate compiler output to 4000 chars to keep DB manageable
+    if compiler_output and len(compiler_output) > 4000:
+        compiler_output = compiler_output[:4000] + "\n... (truncated)"
+
+    conn.execute(
+        "BEGIN IMMEDIATE"
+    )
+    conn.execute(
+        """INSERT INTO impl_build_log
+           (phase_id, agent_id, ticket_id, attempt_number, hypothesis,
+            files_changed, build_result, compiler_output)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            phase_id, agent_id, ticket_id, attempt_number,
+            hypothesis, files_json, build_result, compiler_output,
+        ),
+    )
+    conn.commit()
+
+    # Circle detection: check for 3+ attempts modifying similar files
+    circle_detected = False
+    if attempt_number >= 3:
+        recent = conn.execute(
+            "SELECT files_changed, hypothesis FROM impl_build_log "
+            "WHERE phase_id = ? ORDER BY attempt_number DESC LIMIT 3",
+            (phase_id,),
+        ).fetchall()
+
+        if len(recent) >= 3:
+            # Check file overlap: if all 3 recent attempts touch the same files
+            file_sets = []
+            for r in recent:
+                if r["files_changed"]:
+                    file_sets.append(set(_json.loads(r["files_changed"])))
+                else:
+                    file_sets.append(set())
+
+            if file_sets and all(len(fs) > 0 for fs in file_sets):
+                common = file_sets[0]
+                for fs in file_sets[1:]:
+                    common = common & fs
+                if len(common) > 0:
+                    circle_detected = True
+
+    return {
+        "attempt_number": attempt_number,
+        "circle_detected": circle_detected,
+        "phase_id": phase_id,
+        "ticket_id": ticket_id,
+        "build_result": build_result,
+    }
