@@ -33,3 +33,4 @@ tests/output/
 
 # macOS
 .DS_Store
+*.db

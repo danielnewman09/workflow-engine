@@ -1,0 +1,119 @@
+# Phase definitions for MSD-CPP ticket lifecycle
+# Ticket: 0083_database_agent_orchestration
+#
+# Maps the full MSD-CPP ticket lifecycle to workflow-engine phase definitions.
+# Agent types map to .claude/agents/*.md definitions.
+# Conditions control which phases apply to a given ticket.
+#
+# Human gate phases have agent_type: null — the workflow engine creates a
+# human_gates record and blocks downstream phases until approved via CLI.
+
+# Phases that run before any language-specific work
+preamble:
+  - name: "Math Design"
+    agent_type: "math-designer"
+    condition:
+      field: "requires_math_design"
+      value: true
+
+  - name: "Math Design Review"
+    agent_type: null  # human gate
+    condition:
+      field: "requires_math_design"
+      value: true
+
+# Integration phases — only for multi-language tickets.
+# Inserted between preamble and language pipelines.
+integration:
+  - name: "Integration Design"
+    agent_type: "integration-designer"
+    condition:
+      field: "languages"
+      has_multiple: true
+
+  - name: "Integration Review"
+    agent_type: "integration-reviewer"
+    condition:
+      field: "languages"
+      has_multiple: true
+
+# Per-language pipeline template.
+# Each language follows this identical 5-phase workflow.
+# Agent names are ROLE-ONLY — the loader prefixes the language slug.
+# e.g., language "C++" + role "architect" → agent_type "cpp-architect"
+#
+# For single-language tickets: phases run sequentially (others SKIPPED).
+# For multi-language tickets: same-step phases run in parallel groups.
+language_pipelines:
+  condition_field: "languages"    # metadata field for conditions
+  steps:
+    - step: "Design"
+      role: "architect"
+    - step: "Design Review"
+      role: null                  # human gate (no agent)
+    - step: "Test Writing"
+      role: "test-writer"
+    - step: "Implementation"
+      role: "implementer"
+    - step: "Quality Gate"
+      role: "quality-gate"
+  languages:
+    - name: "C++"
+      slug: "cpp"                 # used to prefix role → "cpp-architect"
+    - name: "Python"
+      slug: "python"
+    - name: "Frontend"
+      slug: "frontend"
+
+# Phases that run after all language-specific work completes
+postamble:
+  - name: "Integration Test"
+    agent_type: "integration-tester"
+
+  - name: "Implementation Review"
+    agent_type: "implementation-reviewer"
+
+  - name: "Documentation"
+    agent_type: "docs-updater"
+
+  - name: "Tutorial"
+    agent_type: "cpp-tutorial-generator"
+    condition:
+      field: "generate_tutorial"
+      value: true
+
+# Metadata fields to extract from ticket markdown for condition evaluation
+# and DB storage. The engine uses these to evaluate phase conditions.
+ticket_metadata:
+  - field: "requires_math_design"
+    type: "boolean"
+    default: false
+    markdown_key: "Requires Math Design"
+
+  - field: "generate_tutorial"
+    type: "boolean"
+    default: false
+    markdown_key: "Generate Tutorial"
+
+  - field: "languages"
+    type: "list"
+    default: ["C++"]
+    markdown_key: "Languages"
+
+  - field: "priority"
+    type: "enum"
+    values: ["Low", "Medium", "High", "Critical"]
+    markdown_key: "Priority"
+
+  - field: "complexity"
+    type: "enum"
+    values: ["Small", "Medium", "Large", "XL"]
+    markdown_key: "Estimated Complexity"
+
+  - field: "components"
+    type: "list"
+    markdown_key: "Target Component(s)"
+
+  - field: "github_issue"
+    type: "integer"
+    markdown_key: "GitHub Issue"

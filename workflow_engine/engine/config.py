@@ -36,15 +36,26 @@ from .models import (
 # ---------------------------------------------------------------------------
 
 DEFAULT_PHASES_YAML = """
-phases:
-  - name: "Design"
-    agent_type: "designer"
-  - name: "Design Review"
-    agent_type: null
-  - name: "Implementation"
-    agent_type: "implementer"
-  - name: "Test Writing"
-    agent_type: "test-writer"
+preamble: []
+
+integration: []
+
+language_pipelines:
+  condition_field: "languages"
+  steps:
+    - step: "Design"
+      role: "architect"
+    - step: "Design Review"
+      role: null
+    - step: "Implementation"
+      role: "implementer"
+    - step: "Test Writing"
+      role: "test-writer"
+  languages:
+    - name: "C++"
+      slug: "cpp"
+
+postamble:
   - name: "Review"
     agent_type: "reviewer"
   - name: "Documentation"
@@ -80,21 +91,148 @@ def _parse_condition(cond_dict: dict[str, Any] | None) -> PhaseCondition | None:
 
 
 # ---------------------------------------------------------------------------
+# Language pipeline expansion
+# ---------------------------------------------------------------------------
+
+
+def _step_slug(step_name: str) -> str:
+    """Convert a step name to a slug for parallel groups.
+
+    e.g. "Design Review" -> "design_review", "Test Writing" -> "test_writing"
+    """
+    return step_name.lower().replace(" ", "_")
+
+
+def _expand_language_pipelines(
+    pipelines_dict: dict[str, Any],
+) -> list[PhaseDefinition]:
+    """Expand the language_pipelines template into individual PhaseDefinitions.
+
+    For each step, generates one phase per language. All phases within the
+    same step share the same order and parallel_group, so they can run
+    concurrently for multi-language tickets.
+
+    Args:
+        pipelines_dict: The language_pipelines section from phases.yaml.
+
+    Returns:
+        List of PhaseDefinition objects for all language/step combinations.
+    """
+    condition_field = pipelines_dict.get("condition_field", "languages")
+    steps = pipelines_dict.get("steps", [])
+    languages = pipelines_dict.get("languages", [])
+
+    definitions: list[PhaseDefinition] = []
+
+    for step_dict in steps:
+        step_name = step_dict["step"]
+        role = step_dict.get("role")
+        parallel_group = _step_slug(step_name)
+
+        for lang_dict in languages:
+            lang_name = lang_dict["name"]
+            slug = lang_dict["slug"]
+
+            phase_name = f"{lang_name} {step_name}"
+            agent_type = f"{slug}-{role}" if role is not None else None
+            condition = PhaseCondition(field=condition_field, contains=lang_name)
+
+            definitions.append(
+                PhaseDefinition(
+                    name=phase_name,
+                    agent_type=agent_type,
+                    condition=condition,
+                    parallel_group=parallel_group,
+                    order=0,  # order is assigned later by load_phase_definitions
+                )
+            )
+
+    return definitions
+
+
+# ---------------------------------------------------------------------------
 # phases.yaml loader
 # ---------------------------------------------------------------------------
+
+
+def _parse_section_phases(
+    section: list[dict[str, Any]] | None,
+) -> list[PhaseDefinition]:
+    """Parse a preamble/integration/postamble section into PhaseDefinitions."""
+    if not section:
+        return []
+    definitions: list[PhaseDefinition] = []
+    for phase_dict in section:
+        definitions.append(
+            PhaseDefinition(
+                name=phase_dict["name"],
+                agent_type=phase_dict.get("agent_type"),
+                condition=_parse_condition(phase_dict.get("condition")),
+                parallel_group=None,
+                order=0,  # assigned later
+            )
+        )
+    return definitions
 
 
 def load_phase_definitions(phases_yaml: dict[str, Any]) -> list[PhaseDefinition]:
     """
     Parse a phases.yaml document into a list of PhaseDefinition objects.
 
-    Handles:
-    - Top-level phases list (sequential)
-    - parallel_groups section (phases that run concurrently)
+    Supports two formats:
+    1. New format: preamble, integration, language_pipelines, postamble
+    2. Legacy format: phases list + parallel_groups
 
     All phases receive an `order` field that controls DB phase_order, used
     by the scheduler to determine availability sequence.
     """
+    # Detect format: new format has language_pipelines or preamble key
+    if "language_pipelines" in phases_yaml or "preamble" in phases_yaml:
+        return _load_phase_definitions_new(phases_yaml)
+    return _load_phase_definitions_legacy(phases_yaml)
+
+
+def _load_phase_definitions_new(phases_yaml: dict[str, Any]) -> list[PhaseDefinition]:
+    """Parse new-format phases.yaml (preamble/integration/language_pipelines/postamble)."""
+    all_phases: list[PhaseDefinition] = []
+
+    # 1. Preamble
+    all_phases.extend(_parse_section_phases(phases_yaml.get("preamble")))
+
+    # 2. Integration
+    all_phases.extend(_parse_section_phases(phases_yaml.get("integration")))
+
+    # 3. Language pipelines
+    pipelines = phases_yaml.get("language_pipelines")
+    if pipelines:
+        all_phases.extend(_expand_language_pipelines(pipelines))
+
+    # 4. Postamble
+    all_phases.extend(_parse_section_phases(phases_yaml.get("postamble")))
+
+    # Assign order: sequential phases get individual orders,
+    # phases sharing a parallel_group get the same order
+    order = 0
+    i = 0
+    while i < len(all_phases):
+        phase = all_phases[i]
+        if phase.parallel_group is not None:
+            # Collect all phases with the same parallel_group (contiguous)
+            group = phase.parallel_group
+            while i < len(all_phases) and all_phases[i].parallel_group == group:
+                all_phases[i].order = order
+                i += 1
+            order += 1
+        else:
+            phase.order = order
+            order += 1
+            i += 1
+
+    return all_phases
+
+
+def _load_phase_definitions_legacy(phases_yaml: dict[str, Any]) -> list[PhaseDefinition]:
+    """Parse legacy-format phases.yaml (phases list + parallel_groups)."""
     definitions: list[PhaseDefinition] = []
     order = 0
 
@@ -111,7 +249,7 @@ def load_phase_definitions(phases_yaml: dict[str, Any]) -> list[PhaseDefinition]
         )
         order += 1
 
-    # Parallel groups — each member gets the same order slot as a group marker
+    # Parallel groups
     for group_name, group_dict in phases_yaml.get("parallel_groups", {}).items():
         for phase_dict in group_dict.get("phases", []):
             definitions.append(
@@ -123,7 +261,6 @@ def load_phase_definitions(phases_yaml: dict[str, Any]) -> list[PhaseDefinition]
                     order=order,
                 )
             )
-        # After group: increment order so the next sequential phase comes after
         order += 1
 
     return definitions

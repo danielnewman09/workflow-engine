@@ -1,0 +1,149 @@
+# Workflow engine configuration for MSD-CPP
+# Ticket: 0083_database_agent_orchestration
+#
+# Stale timeout is 30 minutes (not 10) per design review note:
+# agents may have long reasoning passes without MCP tool calls.
+
+database:
+  path: "build/Debug/docs/workflow.db"  # gitignored, derived state
+
+tickets:
+  directory: "tickets/"
+  pattern: "*.md"
+  id_regex: "^(\\d{4}[a-z]?)_"  # extracts ticket ID from filename
+
+agents:
+  stale_timeout_minutes: 30
+  heartbeat_implicit: true  # any MCP tool call updates heartbeat
+
+  # Maps workflow agent types to Claude Code agent commands.
+  # Used by the supervisor script (cli/supervisor.py) to spawn agents.
+  registry:
+    math-designer:
+      command: "claude"
+      args: ["--agent", "math-designer"]
+      max_concurrent: 1
+
+    math-reviewer:
+      command: "claude"
+      args: ["--agent", "math-reviewer"]
+      max_concurrent: 1
+
+    cpp-architect:
+      command: "claude"
+      args: ["--agent", "languages/cpp/architect"]
+      max_concurrent: 1
+
+    design-reviewer:
+      command: "claude"
+      args: ["--agent", "design-reviewer"]
+      max_concurrent: 1
+
+    integration-designer:
+      command: "claude"
+      args: ["--agent", "integration/designer"]
+      max_concurrent: 1
+
+    integration-reviewer:
+      command: "claude"
+      args: ["--agent", "integration/reviewer"]
+      max_concurrent: 1
+
+    python-architect:
+      command: "claude"
+      args: ["--agent", "languages/python/architect"]
+      max_concurrent: 1
+
+    frontend-architect:
+      command: "claude"
+      args: ["--agent", "languages/frontend/architect"]
+      max_concurrent: 1
+
+    cpp-prototyper:
+      command: "claude"
+      args: ["--agent", "languages/cpp/prototyper"]
+      max_concurrent: 1
+
+    cpp-implementer:
+      command: "claude"
+      args: ["--agent", "languages/cpp/implementer"]
+      max_concurrent: 3
+
+    python-implementer:
+      command: "claude"
+      args: ["--agent", "languages/python/implementer"]
+      max_concurrent: 2
+
+    frontend-implementer:
+      command: "claude"
+      args: ["--agent", "languages/frontend/implementer"]
+      max_concurrent: 2
+
+    cpp-test-writer:
+      command: "claude"
+      args: ["--agent", "languages/cpp/test-writer"]
+      max_concurrent: 2
+
+    python-test-writer:
+      command: "claude"
+      args: ["--agent", "languages/python/test-writer"]
+      max_concurrent: 2
+
+    frontend-test-writer:
+      command: "claude"
+      args: ["--agent", "languages/frontend/test-writer"]
+      max_concurrent: 2
+
+    integration-tester:
+      command: "claude"
+      args: ["--agent", "integration/tester"]
+      max_concurrent: 1
+
+    cpp-quality-gate:
+      command: "claude"
+      args: ["--agent", "languages/cpp/quality-gate"]
+      max_concurrent: 2
+
+    python-quality-gate:
+      command: "claude"
+      args: ["--agent", "languages/python/quality-gate"]
+      max_concurrent: 2
+
+    frontend-quality-gate:
+      command: "claude"
+      args: ["--agent", "languages/frontend/quality-gate"]
+      max_concurrent: 2
+
+    implementation-reviewer:
+      command: "claude"
+      args: ["--agent", "implementation-reviewer"]
+      max_concurrent: 1
+
+    docs-updater:
+      command: "claude"
+      args: ["--agent", "docs-updater"]
+      max_concurrent: 1
+
+    cpp-tutorial-generator:
+      command: "claude"
+      args: ["--agent", "languages/cpp/tutorial-generator"]
+      max_concurrent: 1
+
+file_conflicts:
+  mode: "advisory"  # "advisory" (warn) or "blocking" (prevent)
+
+markdown_sync:
+  status_update: "realtime"     # update checkboxes immediately on phase completion
+  workflow_log_update: "batch"  # update workflow log section on CLI command
+
+priority_order: ["Critical", "High", "Medium", "Low"]
+
+github:
+  repository: "danielnewman09/MSD-CPP"  # owner/repo for gh CLI
+
+traceability:
+  db_path: "build/Debug/docs/traceability.db"  # gitignored, rebuilt from repo
+  source_dir: "msd"                             # C++ source dir for symbol indexing
+  designs_dir: "docs/designs"                   # design documents directory
+  models_path: "replay/replay/models.py"        # Pydantic models
+  generated_models_path: "replay/replay/generated_models.py"
