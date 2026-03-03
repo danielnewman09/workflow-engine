@@ -720,7 +720,9 @@ def resolve_gate(
     if gate is None:
         raise ValueError(f"Gate {gate_id} not found")
 
-    if gate["status"] != "pending":
+    # Allow re-deciding from changes_requested (reviewer approves after revisions)
+    # but not from approved or rejected (terminal decisions)
+    if gate["status"] not in ("pending", "changes_requested"):
         raise ValueError(
             f"Gate {gate_id} is already '{gate['status']}' — cannot re-decide"
         )
@@ -750,7 +752,7 @@ def resolve_gate(
             action=f"{decision}_gate" if decision != "changes_requested" else "request_changes",
             entity_type="gate",
             entity_id=gate_id,
-            old_state="pending",
+            old_state=gate["status"],
             new_state=decision,
             details={
                 "ticket_id": gate["ticket_id"],

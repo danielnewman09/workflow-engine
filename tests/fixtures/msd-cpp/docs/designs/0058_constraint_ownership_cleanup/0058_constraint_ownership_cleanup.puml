@@ -1,0 +1,116 @@
+@startuml
+skinparam class {
+    BackgroundColor<<modified>> LightYellow
+    BackgroundColor<<removed>> LightPink
+}
+
+package "msd-sim::Physics" {
+    ' AssetInertial is modified - constraint storage removed
+    class AssetInertial <<modified>> {
+        - mass_: double
+        - inertiaTensor_: Eigen::Matrix3d
+        - inverseInertiaTensor_: Eigen::Matrix3d
+        - dynamicState_: AssetDynamicState
+        - coefficientOfRestitution_: double
+        - frictionCoefficient_: double
+        ' REMOVED: constraints_
+        ' REMOVED: addConstraint()
+        ' REMOVED: getConstraints()
+        ' REMOVED: removeConstraint()
+        ' REMOVED: clearConstraints()
+        ' REMOVED: getConstraintCount()
+        --
+        + getDynamicState(): AssetDynamicState&
+        + getMass(): double
+        + getInertialState(): InertialState&
+        + applyForce(force: ForceVector): void
+        + applyImpulse(impulse: Vector3D): void
+    }
+
+    ' CollisionPipeline is modified - single owning constraint vector
+    class CollisionPipeline <<modified>> {
+        - collisionHandler_: CollisionHandler
+        - constraintSolver_: ConstraintSolver
+        - contactCache_: ContactCache
+        - positionCorrector_: PositionCorrector
+        - collisions_: vector<CollisionPair>
+        ' CHANGED: Single owning container
+        - allConstraints_: vector<unique_ptr<Constraint>>
+        ' REMOVED: constraints_ (ContactConstraint)
+        ' REMOVED: frictionConstraints_ (FrictionConstraint)
+        ' REMOVED: constraintPtrs_
+        ' REMOVED: normalConstraintPtrs_
+        - states_: vector<reference_wrapper<InertialState>>
+        - inverseMasses_: vector<double>
+        - inverseInertias_: vector<Matrix3d>
+        - pairRanges_: vector<PairConstraintRange>
+        --
+        + execute(inertial, environmental, dt): void
+        + advanceFrame(): void
+        + expireOldEntries(maxAge): void
+        # detectCollisions(inertial, environmental): void
+        # createConstraints(inertial, environmental, dt): void
+        # assembleSolverInput(inertial, environmental, numBodies): void
+        # solveConstraintsWithWarmStart(dt): SolveResult
+        # correctPositions(inertial, environmental, numBodies): void
+        - clearFrameData(): void
+        ' NEW: Typed view generation
+        - buildConstraintViews(): void
+    }
+
+    ' Constraint hierarchy (unchanged, shown for context)
+    abstract class Constraint {
+        + {abstract} jacobian(): MatrixXd
+        + {abstract} bias(): VectorXd
+        + setLambda(lambda: VectorXd): void
+        + getLambda(): VectorXd
+    }
+
+    class ContactConstraint {
+        + jacobian(): MatrixXd
+        + bias(): VectorXd
+    }
+
+    class FrictionConstraint {
+        + jacobian(): MatrixXd
+        + bias(): VectorXd
+    }
+
+    Constraint <|-- ContactConstraint
+    Constraint <|-- FrictionConstraint
+    CollisionPipeline o-- "*" Constraint : owns
+}
+
+' UnitQuaternionConstraint removed (was never used in production)
+class UnitQuaternionConstraint <<removed>> {
+}
+
+note right of AssetInertial
+  **Removed**:
+  - constraints_ vector
+  - addConstraint() / getConstraints()
+  - removeConstraint() / clearConstraints()
+  - getConstraintCount()
+
+  **Result**:
+  - No longer move-only
+  - Can use Rule of Zero
+  - All members are copyable
+end note
+
+note left of CollisionPipeline
+  **Changed**:
+  - Single owning vector: allConstraints_
+  - Replaces 4 vectors (2 owning, 2 non-owning)
+
+  **Added**:
+  - buildConstraintViews() generates typed views:
+    * vector<Constraint*> for solver
+    * vector<ContactConstraint*> for position correction
+    * Derived on-demand, not stored
+
+  **Maintains**:
+  - pairRanges_ for associating constraints to collision pairs
+end note
+
+@enduml

@@ -420,5 +420,6 @@ class WorkflowConfig:
     traceability_designs_dir: str = "docs/designs"  # design documents directory
     traceability_models_path: str = "replay/replay/models.py"  # Pydantic models
     traceability_generated_models_path: str = "replay/replay/generated_models.py"
+    traceability_coverage_info_path: str = "build/Debug/coverage_filtered.info"
     agent_registry: dict[str, dict] = field(default_factory=dict)
     phase_definitions: list[PhaseDefinition] = field(default_factory=list)

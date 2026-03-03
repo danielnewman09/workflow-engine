@@ -13,6 +13,8 @@ from workflow_engine.traceability.index_git import index_git_history
 from workflow_engine.traceability.index_decisions import index_decisions
 from workflow_engine.traceability.index_symbols import index_symbols
 from workflow_engine.traceability.index_records import index_records
+from workflow_engine.traceability.index_tickets import index_tickets
+from workflow_engine.traceability.index_coverage import index_coverage
 
 
 def reindex_all(
@@ -25,6 +27,8 @@ def reindex_all(
     models_path: str = "replay/replay/models.py",
     generated_models_path: str = "replay/replay/generated_models.py",
     skip_symbols: bool = False,
+    coverage_info_path: str = "build/Debug/coverage_filtered.info",
+    store_coverage_lines: bool = True,
 ) -> dict[str, Any]:
     """Run all traceability indexers incrementally.
 
@@ -37,6 +41,8 @@ def reindex_all(
         models_path: Relative path to Pydantic models file.
         generated_models_path: Relative path to generated models file.
         skip_symbols: If True, skip the symbol indexer (expensive).
+        coverage_info_path: Relative path to lcov .info file.
+        store_coverage_lines: Whether to store per-line coverage detail.
 
     Returns:
         Dict with results from each indexer.
@@ -60,6 +66,16 @@ def reindex_all(
         conn, repo_root,
         models_path=models_path,
         generated_models_path=generated_models_path,
+    )
+
+    results["tickets"] = index_tickets(
+        conn, repo_root, tickets_dir=tickets_dir,
+    )
+
+    results["coverage"] = index_coverage(
+        conn, repo_root,
+        info_file=coverage_info_path,
+        store_lines=store_coverage_lines,
     )
 
     return results

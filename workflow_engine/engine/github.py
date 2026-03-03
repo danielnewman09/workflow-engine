@@ -13,9 +13,89 @@ import json
 import re
 import sqlite3
 import subprocess
+import zlib
 from pathlib import Path
 from typing import Any
 
+
+# ---------------------------------------------------------------------------
+# PlantUML rendering
+# ---------------------------------------------------------------------------
+
+# PlantUML uses a custom base64 alphabet for URL encoding
+_PLANTUML_ALPHABET = (
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+)
+
+
+def _plantuml_encode(text: str) -> str:
+    """Encode PlantUML source into the URL-safe text format used by plantuml.com."""
+    compressed = zlib.compress(text.encode("utf-8"))[2:-4]  # raw deflate (strip zlib header/checksum)
+    encoded = []
+    for i in range(0, len(compressed), 3):
+        chunk = compressed[i:i + 3]
+        if len(chunk) == 3:
+            b0, b1, b2 = chunk
+            encoded.append(_PLANTUML_ALPHABET[b0 >> 2])
+            encoded.append(_PLANTUML_ALPHABET[((b0 & 0x3) << 4) | (b1 >> 4)])
+            encoded.append(_PLANTUML_ALPHABET[((b1 & 0xF) << 2) | (b2 >> 6)])
+            encoded.append(_PLANTUML_ALPHABET[b2 & 0x3F])
+        elif len(chunk) == 2:
+            b0, b1 = chunk
+            encoded.append(_PLANTUML_ALPHABET[b0 >> 2])
+            encoded.append(_PLANTUML_ALPHABET[((b0 & 0x3) << 4) | (b1 >> 4)])
+            encoded.append(_PLANTUML_ALPHABET[(b1 & 0xF) << 2])
+        elif len(chunk) == 1:
+            b0 = chunk[0]
+            encoded.append(_PLANTUML_ALPHABET[b0 >> 2])
+            encoded.append(_PLANTUML_ALPHABET[(b0 & 0x3) << 4])
+    return "".join(encoded)
+
+
+def _post_plantuml_comments(
+    project_root: Path,
+    file_paths: list[str],
+) -> list[dict[str, Any]]:
+    """
+    For any .puml files in file_paths, render via plantuml.com and post
+    the image as a PR comment on the current branch's PR.
+
+    Returns a list of results (one per .puml file posted).
+    """
+    puml_files = [f for f in file_paths if f.endswith(".puml")]
+    if not puml_files:
+        return []
+
+    results = []
+    for puml_path in puml_files:
+        full_path = project_root / puml_path
+        if not full_path.exists():
+            results.append({"file": puml_path, "error": "file not found"})
+            continue
+
+        source = full_path.read_text(encoding="utf-8")
+        encoded = _plantuml_encode(source)
+        image_url = f"https://www.plantuml.com/plantuml/svg/{encoded}"
+
+        # Build comment body
+        filename = Path(puml_path).name
+        comment_body = (
+            f"### {filename}\n\n"
+            f"![{filename}]({image_url})\n\n"
+            f"<details><summary>PlantUML source</summary>\n\n"
+            f"```plantuml\n{source}\n```\n\n"
+            f"</details>"
+        )
+
+        post_result = post_pr_comment(project_root, comment_body)
+        results.append({"file": puml_path, **post_result})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Commit message prefixes
+# ---------------------------------------------------------------------------
 
 # Phase name → commit message prefix
 PHASE_PREFIX_MAP = {
@@ -176,40 +256,72 @@ def commit_and_push(
             "Co-Authored-By: Claude <noreply@anthropic.com>"
         )
 
-    # Commit
-    commit_result = _run_git(project_root, ["commit", "-m", message])
-    if commit_result.returncode != 0:
-        return {"error": f"git commit failed: {commit_result.stderr.strip()}"}
+    # Check if there are staged changes to commit
+    diff_result = _run_git(project_root, ["diff", "--cached", "--quiet"])
+    has_staged = diff_result.returncode != 0  # exit 1 = diffs exist
 
-    # Determine current branch
+    if has_staged:
+        # Commit
+        commit_result = _run_git(project_root, ["commit", "-m", message])
+        if commit_result.returncode != 0:
+            return {"error": f"git commit failed: {commit_result.stderr.strip()}"}
+        committed = True
+    else:
+        committed = False
+
+    # Get commit SHA and branch regardless of whether we just committed
+    sha_result = _run_git(project_root, ["rev-parse", "HEAD"])
+    commit_sha = sha_result.stdout.strip()
+
     branch_result = _run_git(project_root, ["branch", "--show-current"])
     branch_name = branch_result.stdout.strip()
 
-    # Check if upstream is set
+    # Check if HEAD is already pushed (local vs remote)
     upstream_result = _run_git(
         project_root, ["rev-parse", "--abbrev-ref", f"{branch_name}@{{upstream}}"]
     )
     has_upstream = upstream_result.returncode == 0
 
-    # Push
+    needs_push = True
     if has_upstream:
-        push_result = _run_git(project_root, ["push"])
-    else:
-        push_result = _run_git(project_root, ["push", "-u", "origin", branch_name])
+        remote_sha = _run_git(
+            project_root, ["rev-parse", f"{branch_name}@{{upstream}}"]
+        )
+        if remote_sha.returncode == 0 and remote_sha.stdout.strip() == commit_sha:
+            needs_push = False
 
-    if push_result.returncode != 0:
-        return {"error": f"git push failed: {push_result.stderr.strip()}"}
+    if needs_push:
+        if has_upstream:
+            push_result = _run_git(project_root, ["push"])
+        else:
+            push_result = _run_git(project_root, ["push", "-u", "origin", branch_name])
 
-    # Get commit SHA
-    sha_result = _run_git(project_root, ["rev-parse", "HEAD"])
-    commit_sha = sha_result.stdout.strip()
+        if push_result.returncode != 0:
+            # Report push failure but include commit info so caller knows state
+            return {
+                "error": f"git push failed: {push_result.stderr.strip()}",
+                "commit_sha": commit_sha,
+                "committed": committed,
+                "pushed": False,
+                "branch_name": branch_name,
+                "files_staged": file_paths,
+            }
 
-    return {
+    # Post PlantUML diagrams as PR comments after successful push
+    puml_results = []
+    if needs_push:
+        puml_results = _post_plantuml_comments(project_root, file_paths)
+
+    result = {
         "commit_sha": commit_sha,
-        "pushed": True,
+        "committed": committed,
+        "pushed": needs_push,
         "branch_name": branch_name,
         "files_staged": file_paths,
     }
+    if puml_results:
+        result["plantuml_comments"] = puml_results
+    return result
 
 
 def create_or_update_pr(
@@ -302,14 +414,25 @@ def create_or_update_pr(
             f"Agent: {agent_id}\n"
         )
 
+    # Ensure labels exist (idempotent — gh label create is a no-op if it exists)
+    labels = [f"ticket:{ticket_id}", f"phase:{row['phase_name']}"]
+    valid_labels = []
+    for label in labels:
+        create_label = _run_gh(
+            project_root,
+            ["label", "create", label, "--force", "--description", ""],
+        )
+        if create_label.returncode == 0:
+            valid_labels.append(label)
+
     # Build gh pr create args
     create_args = [
         "pr", "create",
         "--title", title,
         "--body", body,
-        "--label", f"ticket:{ticket_id}",
-        "--label", f"phase:{row['phase_name']}",
     ]
+    for label in valid_labels:
+        create_args.extend(["--label", label])
     if draft:
         create_args.append("--draft")
 
@@ -332,25 +455,26 @@ def create_or_update_pr(
     }
 
 
-def post_pr_comment(
+# Claude attribution signature appended to agent-authored comments
+CLAUDE_SIGNATURE = "\n\n---\n*🤖 — Claude*"
+
+
+def _find_pr_for_branch(
     project_root: Path,
-    body: str,
 ) -> dict[str, Any]:
     """
-    Post a comment on the PR associated with the current branch.
+    Find the PR number for the current branch.
 
     Returns:
-        {pr_number, commented} on success
-        {error: str} on failure
+        {"pr_number": int, "branch_name": str} on success
+        {"error": str} on failure
     """
-    # Get current branch
     branch_result = _run_git(project_root, ["branch", "--show-current"])
     branch_name = branch_result.stdout.strip()
 
     if not branch_name:
         return {"error": "Could not determine current branch"}
 
-    # Find PR for this branch
     pr_check = _run_gh(
         project_root,
         ["pr", "list", "--head", branch_name, "--json", "number", "--jq", ".[0].number"],
@@ -364,9 +488,28 @@ def post_pr_comment(
     except ValueError:
         return {"error": f"Could not parse PR number from: {pr_check.stdout.strip()}"}
 
-    # Post comment
+    return {"pr_number": pr_number, "branch_name": branch_name}
+
+
+def post_pr_comment(
+    project_root: Path,
+    body: str,
+) -> dict[str, Any]:
+    """
+    Post a comment on the PR associated with the current branch.
+
+    Returns:
+        {pr_number, commented} on success
+        {error: str} on failure
+    """
+    pr_info = _find_pr_for_branch(project_root)
+    if "error" in pr_info:
+        return pr_info
+
+    pr_number = pr_info["pr_number"]
+
     comment_result = _run_gh(
-        project_root, ["pr", "comment", str(pr_number), "--body", body]
+        project_root, ["pr", "comment", str(pr_number), "--body", body + CLAUDE_SIGNATURE]
     )
 
     if comment_result.returncode != 0:
@@ -375,4 +518,132 @@ def post_pr_comment(
     return {
         "pr_number": pr_number,
         "commented": True,
+    }
+
+
+def reply_to_review_comment(
+    project_root: Path,
+    comment_id: int,
+    body: str,
+) -> dict[str, Any]:
+    """
+    Reply to an inline review comment on the current branch's PR.
+
+    Uses the GitHub API to create a threaded reply on a specific
+    review comment, identified by comment_id (from get_pr_reviews).
+
+    Returns:
+        {pr_number, comment_id, replied} on success
+        {error: str} on failure
+    """
+    pr_info = _find_pr_for_branch(project_root)
+    if "error" in pr_info:
+        return pr_info
+
+    pr_number = pr_info["pr_number"]
+    signed_body = body + CLAUDE_SIGNATURE
+
+    # GitHub API: POST /repos/{owner}/{repo}/pulls/{pr}/comments/{comment_id}/replies
+    reply_result = _run_gh(
+        project_root,
+        [
+            "api",
+            f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments/{comment_id}/replies",
+            "-f", f"body={signed_body}",
+        ],
+    )
+
+    if reply_result.returncode != 0:
+        return {"error": f"Reply failed: {reply_result.stderr.strip()}"}
+
+    return {
+        "pr_number": pr_number,
+        "comment_id": comment_id,
+        "replied": True,
+    }
+
+
+def get_pr_reviews(
+    project_root: Path,
+) -> dict[str, Any]:
+    """
+    Fetch review comments and PR comments from the current branch's PR.
+
+    Returns:
+        {pr_number, reviews: [...], comments: [...], review_comments: [...]} on success
+        {error: str} on failure
+
+    Each review_comment includes an 'id' field that can be passed to
+    reply_to_review_comment() to create a threaded reply.
+    """
+    pr_info = _find_pr_for_branch(project_root)
+    if "error" in pr_info:
+        return pr_info
+
+    pr_number = pr_info["pr_number"]
+
+    # Fetch PR reviews (approve/request changes/comment)
+    reviews_result = _run_gh(
+        project_root,
+        [
+            "pr", "view", str(pr_number),
+            "--json", "reviews",
+            "--jq", '.reviews[] | {author: .author.login, state: .state, body: .body, submittedAt: .submittedAt}',
+        ],
+    )
+
+    reviews = []
+    if reviews_result.returncode == 0 and reviews_result.stdout.strip():
+        for line in reviews_result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line:
+                try:
+                    reviews.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    # Fetch PR comments (conversation comments, not inline review comments)
+    comments_result = _run_gh(
+        project_root,
+        [
+            "pr", "view", str(pr_number),
+            "--json", "comments",
+            "--jq", '.comments[] | {author: .author.login, body: .body, createdAt: .createdAt}',
+        ],
+    )
+
+    comments = []
+    if comments_result.returncode == 0 and comments_result.stdout.strip():
+        for line in comments_result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line:
+                try:
+                    comments.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    # Fetch inline review comments (code-level comments)
+    review_comments_result = _run_gh(
+        project_root,
+        [
+            "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments",
+            "--jq", '.[] | {id: .id, author: .user.login, body: .body, path: .path, line: .line, createdAt: .created_at}',
+        ],
+    )
+
+    review_comments = []
+    if review_comments_result.returncode == 0 and review_comments_result.stdout.strip():
+        for line in review_comments_result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line:
+                try:
+                    review_comments.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    return {
+        "pr_number": pr_number,
+        "reviews": reviews,
+        "comments": comments,
+        "review_comments": review_comments,
     }

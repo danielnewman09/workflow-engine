@@ -15,7 +15,7 @@ venv/
 env/
 
 # Database files
-*.db
+# *.db
 *.db-wal
 *.db-shm
 
@@ -23,6 +23,7 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+tests/output/
 
 # IDE
 .idea/

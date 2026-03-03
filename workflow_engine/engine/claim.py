@@ -29,6 +29,8 @@ unresolved 'completion' dependency is never eligible for claiming.
 import sqlite3
 from typing import Any
 
+from workflow_engine.utils.sqlite import rows_to_dicts
+
 from . import audit
 from .models import Phase, PhaseStatus
 
@@ -372,4 +374,4 @@ def list_available(
         """,
         {"agent_type": agent_type, "limit": limit},
     )
-    return [dict(row) for row in cursor.fetchall()]
+    return rows_to_dicts(cursor.fetchall())

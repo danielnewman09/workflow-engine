@@ -234,6 +234,9 @@ def load_workflow_config(
     traceability_generated_models_path = trace_section.get(
         "generated_models_path", "replay/replay/generated_models.py"
     )
+    traceability_coverage_info_path = trace_section.get(
+        "coverage_info_path", "build/Debug/coverage_filtered.info"
+    )
 
     return WorkflowConfig(
         db_path=db_path,
@@ -252,6 +255,7 @@ def load_workflow_config(
         traceability_designs_dir=traceability_designs_dir,
         traceability_models_path=traceability_models_path,
         traceability_generated_models_path=traceability_generated_models_path,
+        traceability_coverage_info_path=traceability_coverage_info_path,
         agent_registry=agent_registry,
         phase_definitions=phase_definitions,
     )
